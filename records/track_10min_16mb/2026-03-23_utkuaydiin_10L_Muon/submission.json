@@ -1,0 +1,6 @@
+{
+  "name": "Utku Aydin",
+  "github": "utkuaydiin",
+  "val_bpb": "1.18",
+  "notes": "Exact reproduction of thwu1 SOTA with corrected SWA + real FineWeb loader"
+}
