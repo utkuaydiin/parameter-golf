@@ -5,8 +5,6 @@ import time
 
 import numpy as np
 import torch
-
-# COPILOT FIX 5 & 6: DDP Imports
 import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
@@ -14,7 +12,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import Optimizer
 from torch.optim.swa_utils import AveragedModel
 
-# COPILOT FIX 1: Hard fail if zstandard is missing
+# COPILOT FIX: Hard fail if zstandard is missing
 try:
     import zstandard
 except ImportError as exc:
@@ -138,7 +136,6 @@ class MuonHybridOptimizer(Optimizer):
 
 # ==================== DATA LOADER ====================
 def get_batch(split="train", batch_size=2, block_size=2048):
-    # COPILOT FIX 3: Dynamic DATA_PATH and globbing
     data_dir = os.environ.get("DATA_PATH", "data/datasets/fineweb10B_sp1024")
     shards = glob.glob(os.path.join(data_dir, f"fineweb_{split}_*.bin"))
 
@@ -152,21 +149,17 @@ def get_batch(split="train", batch_size=2, block_size=2048):
             f"No FineWeb shards found in {data_dir}. Set FINEWEB_ALLOW_RANDOM_TOKENS=1 to test."
         )
 
-    # Pick a random shard
     filename = shards[torch.randint(0, len(shards), (1,)).item()]
-
     header_nbytes = 1024
     data = np.memmap(filename, dtype=np.uint16, mode="r", offset=header_nbytes)
 
-    # COPILOT FIX 2: Explicit size check before sampling
     data_len = len(data)
     if data_len <= block_size + 1:
-        raise ValueError(
-            f"Shard '{filename}' is too small: has {data_len} tokens, "
-            f"but requires more than {block_size + 1} tokens."
-        )
+        raise ValueError(f"Shard '{filename}' is too small.")
 
-    ix = torch.randint(data_len - block_size - 1, (batch_size,))
+    # COPILOT FIX: Convert tensor to standard Python list for safe NumPy slicing
+    ix = torch.randint(data_len - block_size - 1, (batch_size,)).tolist()
+
     x = torch.stack(
         [torch.from_numpy((data[i : i + block_size]).astype(np.int64)) for i in ix]
     )
@@ -209,9 +202,11 @@ class CustomBinaryCheckpoint:
         sd = model.state_dict()
         packed = {}
         for name, t in sd.items():
-            if "wte" in name or "lm_head" in name or t.ndim == 1:
+            # COPILOT FIX: Keep anything that ISN'T 2D as raw FP16 (fixes 3D Conv1d crash)
+            if t.ndim != 2 or "wte" in name or "lm_head" in name:
                 packed[name] = t.cpu().to(torch.float16)
                 continue
+
             clip = 15 if "mlp" in name else 31
             scale = t.abs().amax(dim=1, keepdim=True).clamp_min(1e-12) / clip
             q = (
@@ -258,7 +253,6 @@ class ParameterGolfGPT(nn.Module):
         super().__init__()
         self.wte = nn.Embedding(config.vocab_size, config.n_embd)
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size)
-        # COPILOT FIX 4: Tie from WTE so state_dict doesn't duplicate the 16MB file bloat
         self.lm_head.weight = self.wte.weight
 
         self.smear = SmearGate(config.n_embd)
@@ -323,14 +317,11 @@ if __name__ == "__main__":
     c = Config()
     model = ParameterGolfGPT(c).to(device)
 
-    # Initialize orthogonal weights globally on master process (already handled roughly by PyTorch)
-    # Wrap in DDP if running distributed
     raw_model = model
     if ddp:
         model = DDP(model, device_ids=[ddp_local_rank])
         raw_model = model.module
 
-    # Pass the underlying raw_model to optimizer and SWA so it doesn't get confused by DDP wrappers
     optimizer = MuonHybridOptimizer(raw_model)
     swa_model = AveragedModel(raw_model)
 
@@ -352,7 +343,6 @@ if __name__ == "__main__":
                 f"Step {optimizer.step_count} | Loss: {loss.item():.4f} | Time: {time.time() - start:.1f}s"
             )
 
-    # COPILOT FIX 5 & 6: Only Rank 0 packs and saves the final artifact
     if master_process:
         finalize_and_pack(raw_model, swa_model, c)
 
