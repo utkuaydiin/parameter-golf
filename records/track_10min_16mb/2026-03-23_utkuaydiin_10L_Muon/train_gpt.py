@@ -12,7 +12,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import Optimizer
 from torch.optim.swa_utils import AveragedModel
 
-# COPILOT FIX: Hard fail if zstandard is missing
+# ==================== HARD FAIL FOR COMPRESSION ====================
 try:
     import zstandard
 except ImportError as exc:
@@ -21,7 +21,7 @@ except ImportError as exc:
         "Install it with 'pip install zstandard' to enable compression."
     ) from exc
 
-# Setup DDP
+# ==================== DDP SETUP ====================
 ddp = int(os.environ.get("RANK", -1)) != -1
 if ddp:
     dist.init_process_group(backend="nccl")
@@ -155,11 +155,12 @@ def get_batch(split="train", batch_size=2, block_size=2048):
 
     data_len = len(data)
     if data_len <= block_size + 1:
-        raise ValueError(f"Shard '{filename}' is too small.")
+        raise ValueError(
+            f"Shard '{filename}' is too small: has {data_len} tokens, "
+            f"but requires more than {block_size + 1} tokens."
+        )
 
-    # COPILOT FIX: Convert tensor to standard Python list for safe NumPy slicing
     ix = torch.randint(data_len - block_size - 1, (batch_size,)).tolist()
-
     x = torch.stack(
         [torch.from_numpy((data[i : i + block_size]).astype(np.int64)) for i in ix]
     )
@@ -202,7 +203,6 @@ class CustomBinaryCheckpoint:
         sd = model.state_dict()
         packed = {}
         for name, t in sd.items():
-            # COPILOT FIX: Keep anything that ISN'T 2D as raw FP16 (fixes 3D Conv1d crash)
             if t.ndim != 2 or "wte" in name or "lm_head" in name:
                 packed[name] = t.cpu().to(torch.float16)
                 continue
@@ -328,7 +328,18 @@ if __name__ == "__main__":
     start = time.time()
     print0("=== STARTING 10-MINUTE TRAINING ===")
 
-    while time.time() - start < 590:
+    stop_flag = torch.tensor(0, device=device)
+
+    while True:
+        if master_process and (time.time() - start >= 590):
+            stop_flag.fill_(1)
+
+        if ddp:
+            dist.broadcast(stop_flag, src=0)
+
+        if stop_flag.item() == 1:
+            break
+
         x, y = get_batch()
         _, loss = model(x, y)
         loss.backward()
@@ -342,6 +353,9 @@ if __name__ == "__main__":
             print0(
                 f"Step {optimizer.step_count} | Loss: {loss.item():.4f} | Time: {time.time() - start:.1f}s"
             )
+
+    if ddp:
+        dist.barrier()
 
     if master_process:
         finalize_and_pack(raw_model, swa_model, c)
