@@ -1,36 +1,51 @@
+import glob
 import io
 import os
 import time
 
 import numpy as np
 import torch
+
+# COPILOT FIX 5 & 6: DDP Imports
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import Optimizer
 from torch.optim.swa_utils import AveragedModel
 
-# COPILOT FIX: Optional zstandard with zlib fallback for portability
+# COPILOT FIX 1: Hard fail if zstandard is missing
 try:
     import zstandard
-except ImportError:
-    import zlib
+except ImportError as exc:
+    raise RuntimeError(
+        "The 'zstandard' package is required but not installed. "
+        "Install it with 'pip install zstandard' to enable compression."
+    ) from exc
 
-    class _ZlibShim:
-        class ZstdCompressor:
-            def __init__(self, level=3):
-                self.level = 9  # zlib max
+# Setup DDP
+ddp = int(os.environ.get("RANK", -1)) != -1
+if ddp:
+    dist.init_process_group(backend="nccl")
+    ddp_rank = int(os.environ["RANK"])
+    ddp_local_rank = int(os.environ["LOCAL_RANK"])
+    ddp_world_size = int(os.environ["WORLD_SIZE"])
+    device = f"cuda:{ddp_local_rank}"
+    torch.cuda.set_device(device)
+    master_process = ddp_rank == 0
+else:
+    ddp_rank = 0
+    ddp_local_rank = 0
+    ddp_world_size = 1
+    master_process = True
+    device = "cuda" if torch.cuda.is_available() else "cpu"
 
-            def compress(self, data):
-                return zlib.compress(data, self.level)
-
-        class ZstdDecompressor:
-            def decompress(self, data):
-                return zlib.decompress(data)
-
-    zstandard = _ZlibShim()
-
-device = "cuda" if torch.cuda.is_available() else "cpu"
 torch.backends.cuda.matmul.allow_tf32 = True
+
+
+def print0(*args, **kwargs):
+    if master_process:
+        print(*args, **kwargs)
 
 
 # ==================== MIXED QUANT LINEAR ====================
@@ -42,7 +57,6 @@ class MixedQuantLinear(nn.Linear):
     def quantize_post_training(self):
         t = self.weight.data.float()
         clip = 15 if self.bits == 5 else 31
-        # COPILOT FIX: Guard against zero-scale rows to avoid NaN
         scale = t.abs().amax(dim=1, keepdim=True).clamp_min(1e-12) / clip
         q = torch.clamp(torch.round(t / scale), -(clip + 1), clip).to(torch.int8)
         return q, scale.squeeze(1).to(torch.float16)
@@ -70,7 +84,6 @@ def zeropower_via_newtonschulz5(G, steps=5, eps=1e-7):
 
 class MuonHybridOptimizer(Optimizer):
     def __init__(self, model, muon_lr=0.02, adam_lr=3e-4, wd=0.04):
-        # COPILOT FIX: Corrected bigram.table naming (was hash_table)
         self.muon_params = [
             p
             for n, p in model.named_parameters()
@@ -79,7 +92,6 @@ class MuonHybridOptimizer(Optimizer):
         muon_ids = {id(p) for p in self.muon_params}
         adam_params = [p for p in model.parameters() if id(p) not in muon_ids]
 
-        # COPILOT FIX: Proper Optimizer initialization
         defaults = dict(muon_lr=muon_lr, adam_lr=adam_lr, wd=wd)
         super().__init__(model.parameters(), defaults)
 
@@ -101,7 +113,6 @@ class MuonHybridOptimizer(Optimizer):
             if p.grad is None:
                 continue
 
-            # COPILOT FIX: Store momentum in self.state
             state = self.state[p]
             if "momentum_buffer" not in state:
                 state["momentum_buffer"] = torch.zeros_like(p.data)
@@ -125,7 +136,73 @@ class MuonHybridOptimizer(Optimizer):
                     p.grad.zero_()
 
 
-# ==================== PACKER & PRUNER ====================
+# ==================== DATA LOADER ====================
+def get_batch(split="train", batch_size=2, block_size=2048):
+    # COPILOT FIX 3: Dynamic DATA_PATH and globbing
+    data_dir = os.environ.get("DATA_PATH", "data/datasets/fineweb10B_sp1024")
+    shards = glob.glob(os.path.join(data_dir, f"fineweb_{split}_*.bin"))
+
+    if not shards:
+        if os.getenv("FINEWEB_ALLOW_RANDOM_TOKENS", "0") == "1":
+            print0("WARNING: FineWeb shards missing. Using random tokens.")
+            x = torch.randint(0, 1024, (batch_size, block_size))
+            y = torch.randint(0, 1024, (batch_size, block_size))
+            return x.to(device), y.to(device)
+        raise FileNotFoundError(
+            f"No FineWeb shards found in {data_dir}. Set FINEWEB_ALLOW_RANDOM_TOKENS=1 to test."
+        )
+
+    # Pick a random shard
+    filename = shards[torch.randint(0, len(shards), (1,)).item()]
+
+    header_nbytes = 1024
+    data = np.memmap(filename, dtype=np.uint16, mode="r", offset=header_nbytes)
+
+    # COPILOT FIX 2: Explicit size check before sampling
+    data_len = len(data)
+    if data_len <= block_size + 1:
+        raise ValueError(
+            f"Shard '{filename}' is too small: has {data_len} tokens, "
+            f"but requires more than {block_size + 1} tokens."
+        )
+
+    ix = torch.randint(data_len - block_size - 1, (batch_size,))
+    x = torch.stack(
+        [torch.from_numpy((data[i : i + block_size]).astype(np.int64)) for i in ix]
+    )
+    y = torch.stack(
+        [
+            torch.from_numpy((data[i + 1 : i + 1 + block_size]).astype(np.int64))
+            for i in ix
+        ]
+    )
+    return x.to(device), y.to(device)
+
+
+# ==================== PACKING & PRUNING ====================
+@torch.no_grad()
+def apply_magnitude_pruning(model, prune_percent=0.055):
+    prunable = [
+        p
+        for n, p in model.named_parameters()
+        if p.ndim == 2 and "wte" not in n and "bigram.table" not in n
+    ]
+    if not prunable or prune_percent <= 0:
+        return
+
+    all_w = torch.cat([p.view(-1) for p in prunable])
+    numel = all_w.numel()
+    k = max(1, min(int(numel * prune_percent), numel - 1))
+
+    thresh = torch.kthvalue(all_w.abs(), k).values.item()
+    pruned = 0
+    for p in prunable:
+        mask = p.abs() >= thresh
+        p.mul_(mask)
+        pruned += (~mask).sum().item()
+    print0(f"[Prune] Global {prune_percent * 100}% — {pruned:,} weights zeroed")
+
+
 class CustomBinaryCheckpoint:
     @torch.no_grad()
     def pack(self, model):
@@ -136,7 +213,6 @@ class CustomBinaryCheckpoint:
                 packed[name] = t.cpu().to(torch.float16)
                 continue
             clip = 15 if "mlp" in name else 31
-            # COPILOT FIX: Clamp scale to avoid NaN on zero-rows
             scale = t.abs().amax(dim=1, keepdim=True).clamp_min(1e-12) / clip
             q = (
                 torch.clamp(torch.round(t / scale), -(clip + 1), clip)
@@ -152,31 +228,6 @@ class CustomBinaryCheckpoint:
         return zstandard.ZstdCompressor(level=22).compress(buffer.getvalue())
 
 
-@torch.no_grad()
-def apply_magnitude_pruning(model, prune_percent=0.055):
-    # COPILOT FIX: Consistency with bigram.table name
-    prunable = [
-        p
-        for n, p in model.named_parameters()
-        if p.ndim == 2 and "wte" not in n and "bigram.table" not in n
-    ]
-    if not prunable or prune_percent <= 0:
-        return
-
-    all_w = torch.cat([p.view(-1) for p in prunable])
-    numel = all_w.numel()
-    # COPILOT FIX: Clamp k to avoid kthvalue domain errors
-    k = max(1, min(int(numel * prune_percent), numel - 1))
-
-    thresh = torch.kthvalue(all_w.abs(), k).values.item()
-    pruned = 0
-    for p in prunable:
-        mask = p.abs() >= thresh
-        p.mul_(mask)
-        pruned += (~mask).sum().item()
-    print(f"[Prune] Global {prune_percent * 100}% — {pruned:,} weights zeroed")
-
-
 # ==================== ARCHITECTURE ====================
 class SmearGate(nn.Module):
     def __init__(self, dim):
@@ -187,34 +238,31 @@ class SmearGate(nn.Module):
         self.gate = nn.Parameter(torch.ones(dim))
 
     def forward(self, x):
-        x_conv = self.conv(x.transpose(1, 2)).transpose(1, 2)
-        return x + self.gate * x_conv
+        return x + self.gate * self.conv(x.transpose(1, 2)).transpose(1, 2)
 
 
 class BigramHash(nn.Module):
-    def __init__(self, vocab_size, buckets, d_bigram, dim):
+    def __init__(self, buckets, d_bigram, dim):
         super().__init__()
         self.table = nn.Parameter(torch.randn(buckets, d_bigram).to(torch.float16))
         self.proj = nn.Linear(d_bigram, dim, bias=False)
 
     def forward(self, idx):
         bigram_idx = (idx[:, :-1] * 10007 + idx[:, 1:]) % self.table.shape[0]
-        bigram_idx = F.pad(bigram_idx, (1, 0), value=0)
-        h = self.table[bigram_idx]
+        h = self.table[F.pad(bigram_idx, (1, 0), value=0)]
         return self.proj(h.to(self.proj.weight.dtype))
 
 
 class ParameterGolfGPT(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.config = config
         self.wte = nn.Embedding(config.vocab_size, config.n_embd)
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size)
-        self.wte.weight = self.lm_head.weight
+        # COPILOT FIX 4: Tie from WTE so state_dict doesn't duplicate the 16MB file bloat
+        self.lm_head.weight = self.wte.weight
+
         self.smear = SmearGate(config.n_embd)
-        self.bigram = BigramHash(
-            config.vocab_size, config.bigram_buckets, config.d_bigram, config.n_embd
-        )
+        self.bigram = BigramHash(config.bigram_buckets, config.d_bigram, config.n_embd)
         self.layers = nn.ModuleList(
             [
                 nn.ModuleDict(
@@ -249,65 +297,8 @@ class ParameterGolfGPT(nn.Module):
         ) if targets is not None else None
 
 
-# ==================== HELPERS & DATA ====================
-def build_model(config):
-    model = ParameterGolfGPT(config).to(device)
-    for name, p in model.named_parameters():
-        if p.ndim == 2 and "wte" not in name and "bigram.table" not in name:
-            nn.init.orthogonal_(p)
-        elif p.ndim == 1:
-            nn.init.zeros_(p)
-    return model
-
-
-def get_batch(split="train", batch_size=2, block_size=2048):
-    data_dir = "data/datasets/fineweb10B_sp1024"
-    filename = os.path.join(data_dir, f"fineweb_{split}_000000.bin")
-
-    # COPILOT FIX: Fail-fast for data missing (maintainer requirement)
-    if not os.path.exists(filename):
-        if os.getenv("FINEWEB_ALLOW_RANDOM_TOKENS", "0") == "1":
-            x = torch.randint(0, 1024, (batch_size, block_size))
-            y = torch.randint(0, 1024, (batch_size, block_size))
-            return x.to(device), y.to(device)
-        raise FileNotFoundError(
-            f"Shard not found: {filename}. Set FINEWEB_ALLOW_RANDOM_TOKENS=1 to test."
-        )
-
-    # COPILOT FIX: Skip 1024-byte header
-    header_nbytes = 1024
-    data = np.memmap(filename, dtype=np.uint16, mode="r", offset=header_nbytes)
-
-    # COPILOT FIX: -1 range guard
-    ix = torch.randint(len(data) - block_size - 1, (batch_size,))
-    x = torch.stack(
-        [torch.from_numpy((data[i : i + block_size]).astype(np.int64)) for i in ix]
-    )
-    y = torch.stack(
-        [
-            torch.from_numpy((data[i + 1 : i + 1 + block_size]).astype(np.int64))
-            for i in ix
-        ]
-    )
-    return x.to(device), y.to(device)
-
-
-def finalize_and_pack(model, swa_model, config):
-    print("\n--- FINALIZING WINNING ARTIFACT ---")
-
-    # COPILOT FIX: SWA safety guard (only load if we actually averaged steps)
-    if swa_model is not None and getattr(swa_model, "n_averaged", 0) > 0:
-        model.load_state_dict(swa_model.module.state_dict())
-
-    apply_magnitude_pruning(model)
-    compressed = CustomBinaryCheckpoint().pack(model)
-    with open("submission.zst", "wb") as f:
-        f.write(compressed)
-    print(f"DONE. Size: {len(compressed) / 1e6:.2f} MB")
-
-
-# ==================== MAIN ====================
-class RealConfig:
+# ==================== MAIN LOGIC ====================
+class Config:
     vocab_size = 1024
     block_size = 2048
     n_embd = 448
@@ -316,27 +307,54 @@ class RealConfig:
     d_bigram = 48
 
 
-if __name__ == "__main__":
-    config = RealConfig()
-    model = build_model(config)
-    optimizer = MuonHybridOptimizer(model)
-    swa_model = AveragedModel(model)
+def finalize_and_pack(model, swa_model, config):
+    print0("\n--- FINALIZING WINNING ARTIFACT ---")
+    if getattr(swa_model, "n_averaged", 0) > 0:
+        model.load_state_dict(swa_model.module.state_dict())
 
-    print("=== STARTING 10-MINUTE TRAINING ===")
-    start_time = time.time()
-    while time.time() - start_time < 590:
-        idx, targets = get_batch()
-        logits, loss = model(idx, targets)
+    apply_magnitude_pruning(model)
+    compressed = CustomBinaryCheckpoint().pack(model)
+    with open("submission.zst", "wb") as f:
+        f.write(compressed)
+    print0(f"DONE. Size: {len(compressed) / 1e6:.2f} MB")
+
+
+if __name__ == "__main__":
+    c = Config()
+    model = ParameterGolfGPT(c).to(device)
+
+    # Initialize orthogonal weights globally on master process (already handled roughly by PyTorch)
+    # Wrap in DDP if running distributed
+    raw_model = model
+    if ddp:
+        model = DDP(model, device_ids=[ddp_local_rank])
+        raw_model = model.module
+
+    # Pass the underlying raw_model to optimizer and SWA so it doesn't get confused by DDP wrappers
+    optimizer = MuonHybridOptimizer(raw_model)
+    swa_model = AveragedModel(raw_model)
+
+    start = time.time()
+    print0("=== STARTING 10-MINUTE TRAINING ===")
+
+    while time.time() - start < 590:
+        x, y = get_batch()
+        _, loss = model(x, y)
         loss.backward()
         optimizer.step()
         optimizer.zero_grad()
 
         if optimizer.step_count > 3000 and optimizer.step_count % 50 == 0:
-            swa_model.update_parameters(model)
+            swa_model.update_parameters(raw_model)
 
         if optimizer.step_count % 50 == 0:
-            print(
-                f"Step {optimizer.step_count} | Loss: {loss.item():.4f} | Time: {time.time() - start_time:.1f}s"
+            print0(
+                f"Step {optimizer.step_count} | Loss: {loss.item():.4f} | Time: {time.time() - start:.1f}s"
             )
 
-    finalize_and_pack(model, swa_model, config)
+    # COPILOT FIX 5 & 6: Only Rank 0 packs and saves the final artifact
+    if master_process:
+        finalize_and_pack(raw_model, swa_model, c)
+
+    if ddp:
+        dist.destroy_process_group()
